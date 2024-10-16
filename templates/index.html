@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Dearest...</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <h1>My Dearest...</h1>
+    <button id="startButton">Start Listening</button>
+    <div id="status" class="ready">Ready</div>
+    <div id="speechStatus"></div>
+    <div id="result"></div>
+    <div id="console"></div>
+    <audio id="beepSound" src="{{ url_for('serve_beep') }}"></audio>
+    <audio id="responseAudio" style="display: none;"></audio>
+
+    <script>
+        const socket = io();
+        let recognition;
+        let isListening = false;
+        let audioContext;
+        let analyser;
+        let microphone;
+        let dataArray;
+        let isSpeechDetected = false;
+        let isSystemSpeaking = false;
+        let audioQueue = [];
+        let isPlayingAudio = false;
+        let responseComplete = false;
+
+        const consoleDiv = document.getElementById('console');
+        const statusDiv = document.getElementById('status');
+        const speechStatusDiv = document.getElementById('speechStatus');
+        const resultDiv = document.getElementById('result');
+        const startButton = document.getElementById('startButton');
+        const beepSound = document.getElementById('beepSound');
+        const responseAudio = document.getElementById('responseAudio');
+        const BUFFER_THRESHOLD = 2;  // Start playing after receiving 3 chunks
+
+        function updateStatus(message, className) {
+            statusDiv.textContent = message;
+            statusDiv.className = className;
+            logMessage(message);
+        }
+
+        function logMessage(message) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'console-message';
+            messageElement.textContent = new Date().toLocaleTimeString() + ': ' + message;
+            consoleDiv.appendChild(messageElement);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        startButton.addEventListener('click', toggleListening);
+
+        function toggleListening() {
+            if (!isListening) {
+                startListening();
+            } else {
+                stopListening();
+            }
+        }
+
+        function startListening() {
+            if ('webkitSpeechRecognition' in window) {
+                recognition = new webkitSpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = false;
+
+                recognition.onstart = () => {
+                    isListening = true;
+                    updateStatus('Listening...', 'listening');
+                    startButton.textContent = 'Stop Listening';
+                };
+
+                recognition.onresult = (event) => {
+                    if (isSystemSpeaking) {
+                        console.log('System is speaking. Ignoring input.');
+                        return;
+                    }
+                    const transcript = event.results[event.results.length - 1][0].transcript;
+                    console.log('Recognized:', transcript);
+                    socket.emit('transcription', transcript);
+                };
+
+                recognition.onerror = (event) => {
+                    console.error('Speech recognition error:', event.error);
+                    logMessage('Speech recognition error: ' + event.error);
+                    stopListening();
+                };
+
+                recognition.onend = () => {
+                    if (isListening) {
+                        recognition.start();
+                    }
+                };
+
+                try {
+                    recognition.start();
+                    console.log('Recognition attempted to start');
+                } catch (error) {
+                    console.error('Error starting recognition:', error);
+                }
+
+                // Set up audio context for VAD
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(stream => {
+                        microphone = audioContext.createMediaStreamSource(stream);
+                        microphone.connect(analyser);
+                        analyser.fftSize = 2048;
+                        dataArray = new Uint8Array(analyser.frequencyBinCount);
+                        detectSpeech();
+                    })
+                    .catch(err => {
+                        console.error('Error accessing microphone:', err);
+                        logMessage('Error accessing microphone: ' + err);
+                    });
+            } else {
+                console.error('Web Speech API is not supported in this browser.');
+                updateStatus('Speech recognition not supported', 'ready');
+            }
+        }
+
+        function stopListening() {
+            if (recognition) {
+                recognition.stop();
+                isListening = false;
+                updateStatus('Ready', 'ready');
+                startButton.textContent = 'Start Listening';
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+        }
+
+        function detectSpeech() {
+            if (!isSystemSpeaking) {
+                analyser.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+                if (average > 50) {  // Adjust this threshold as needed
+                    socket.emit('audio_data', dataArray.buffer);
+                }
+            }
+            if (isListening) {
+                requestAnimationFrame(detectSpeech);
+            }
+        }
+
+        socket.on('conversation_started', function() {
+            beepSound.play();
+            updateStatus('Conversation started. Listening...', 'listening');
+        });
+
+        socket.on('ai_response', function(data) {
+            resultDiv.textContent = data.text;
+            if (data.is_final) {
+                updateStatus('Listening...', 'ready');
+            }
+            logMessage('AI Response: ' + data.text);
+        });
+
+        socket.on('audio_response', function(data) {
+            if (data.url) {
+                responseAudio.src = data.url;
+                responseAudio.style.display = 'block';
+                playAudio();
+            } else {
+                console.error('Received null or undefined audio URL');
+            }
+        });
+
+    socket.on('audio_chunk', function(data) {
+        const blob = new Blob([data.chunk], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        audioQueue.push(url);
+        if (!isPlayingAudio && audioQueue.length >= BUFFER_THRESHOLD) {
+            playNextAudio();
+        }
+    });
+
+    socket.on('response_complete', function() {
+        responseComplete = true;
+        if (!isPlayingAudio && audioQueue.length === 0) {
+            switchToListeningMode();
+        }
+    });
+
+function playNextAudio() {
+    if (audioQueue.length > 0) {
+        isPlayingAudio = true;
+        isSystemSpeaking = true;
+        updateStatus('Speaking...', 'speaking');
+        const audioUrl = audioQueue.shift();
+        responseAudio.src = audioUrl;
+        responseAudio.play()
+            .then(() => {
+                responseAudio.onended = () => {
+                    URL.revokeObjectURL(audioUrl);
+
+                    // Change: Immediately switch back to listening after playback ends
+                    switchToListeningMode();
+
+                    // Continue playing the next audio if available
+                    if (audioQueue.length > 0) {
+                        playNextAudio();
+                    } else {
+                        isPlayingAudio = false;
+                        if (responseComplete) {
+                            // Already switched to listening, no need to wait for responseComplete
+                        }
+                    }
+                };
+            })
+            .catch(e => {
+                console.error('Error playing audio:', e);
+                isPlayingAudio = false;
+
+                // Ensure the system goes back to listening even if there's an error
+                switchToListeningMode();
+
+                if (audioQueue.length > 0) {
+                    playNextAudio();  // Try the next audio in queue
+                }
+            });
+    }
+}
+
+function switchToListeningMode() {
+    isSystemSpeaking = false;
+    updateStatus('Listening...', 'listening');
+    socket.emit('system_speaking', { 'speaking': false });
+    responseComplete = false;  // Reset completion flag if needed
+}
+
+        function playAudio() {
+            isSystemSpeaking = true;
+            updateStatus('Speaking...', 'speaking');
+            responseAudio.play()
+                .then(() => {
+                    responseAudio.onended = () => {
+                        isSystemSpeaking = false;
+                        updateStatus('Listening...', 'listening');
+                    };
+                })
+                .catch(e => console.error('Error playing audio:', e));
+        }
+
+        socket.on('speech_detected', function(data) {
+            speechStatusDiv.textContent = data.detected ? 'Speech detected' : 'No speech detected';
+        });
+
+        socket.on('system_speaking', function(data) {
+            isSystemSpeaking = data.speaking;
+            if (data.speaking) {
+                updateStatus('Speaking...', 'speaking');
+            } else {
+                updateStatus('Listening...', 'listening');
+            }
+        });
+
+        socket.on('connect', () => logMessage('Connected to server'));
+        socket.on('disconnect', () => logMessage('Disconnected from server'));
+
+        window.onload = () => {
+            logMessage('Page loaded. Click "Start Listening" to begin.');
+        };
+    </script>
+</body>
+</html>
