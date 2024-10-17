@@ -16,7 +16,7 @@ def stream_tts(text):
                 "input": f"<speak>{text}</speak>",
                 "voice_id": VOICE_ID,
                 "speed": 1.2,  # Increase speed (1.0 is normal)
-                "sample_rate": 24000,
+                "sample_rate": 25000,
             },
             headers={
                 "Authorization": f"Bearer {API_KEY}",
@@ -27,7 +27,7 @@ def stream_tts(text):
         )
 
         if response.ok:
-            return response.iter_content(chunk_size=16384)
+            return response.iter_content(chunk_size=8192)
         else:
             print(f"Failed to generate audio: {response.status_code}")
             print(f"Response content: {response.content}")

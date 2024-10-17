@@ -9,6 +9,8 @@ import requests
 import time
 from streaming_tts import stream_tts
 from dotenv import load_dotenv
+import threading
+import queue
 
 load_dotenv()
 
@@ -25,7 +27,7 @@ vad = webrtcvad.Vad(3)  # Aggressiveness mode (0-3)
 
 # Feature flag for streaming TTS
 #USE_STREAMING_TTS = os.getenv('USE_STREAMING_TTS', 'True').lower() == 'true'
-USE_STREAMING_TTS = False
+USE_STREAMING_TTS = True
 
 SYSTEM_PROMPT = ("You are a calm, soothing assistant who speaks in a warm, empathetic, and gentle manner. "
                  "Your responses should make the user feel heard and understood, similar to a therapist. "
@@ -36,30 +38,26 @@ COOLDOWN_PERIOD = float(os.getenv('COOLDOWN_PERIOD', 0))
 
 # Flag to indicate if the system is currently speaking
 is_speaking = False
-
+# Queue for text-to-speech processing
+tts_queue = queue.Queue()
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-
 @app.route('/beep')
 def serve_beep():
     return send_from_directory('static/audio', 'beep.mp3', mimetype='audio/mpeg')
-
 
 @socketio.on('connect')
 def handle_connect():
     print('Client connected')
 
-
 @socketio.on('disconnect')
 def handle_disconnect():
     print('Client disconnected')
 
-
 last_response_time = 0
-
 
 @socketio.on('transcription')
 def handle_transcription(transcription):
@@ -83,7 +81,6 @@ def handle_transcription(transcription):
     process_command(transcription)
     last_response_time = current_time
 
-
 def process_command(command):
     global is_speaking
 
@@ -102,7 +99,17 @@ def process_command(command):
     is_speaking = False
     emit('system_speaking', {'speaking': False})
 
-
+def tts_worker():
+    """Worker function for text-to-speech processing"""
+    while True:
+        text = tts_queue.get()
+        if text is None:
+            break
+        audio_stream = stream_tts(text)
+        if audio_stream:
+            for audio_chunk in audio_stream:
+                socketio.emit('audio_chunk', {'chunk': audio_chunk})
+        tts_queue.task_done()
 def stream_response(conversation):
     try:
         response = client.chat.completions.create(
@@ -111,32 +118,38 @@ def stream_response(conversation):
             stream=True
         )
 
+        # Start TTS worker thread
+        tts_thread = threading.Thread(target=tts_worker)
+        tts_thread.start()
+
         collected_messages = []
-        # for chunk in response:
-        #     if chunk.choices[0].delta.content is not None:
-        #         content = chunk.choices[0].delta.content
-        #         collected_messages.append(content)
-        #         full_reply_content = ''.join(collected_messages).strip()
-        #         emit('ai_response', {'text': full_reply_content, 'is_final': False})
-        #
-        #         audio_stream = stream_tts(content)
-        #         if audio_stream:
-        #             for audio_chunk in audio_stream:
-        #                 emit('audio_chunk', {'chunk': audio_chunk})
         batched_content = ""
         for chunk in response:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
+                collected_messages.append(content)
                 batched_content += content
-                if len(batched_content) >= 60:  # Send to TTS every 100 characters
-                    audio_stream = stream_tts(batched_content)
-                    if audio_stream:
-                        for audio_chunk in audio_stream:
-                            emit('audio_chunk', {'chunk': audio_chunk})
+                full_reply_content = ''.join(collected_messages).strip()
+                emit('ai_response', {'text': full_reply_content, 'is_final': False})
+
+                if len(batched_content) >= 40:  # Send to TTS every 60 characters
+                    tts_queue.put(batched_content)
                     batched_content = ""
-            full_reply_content = ''.join(collected_messages).strip()
-            conversation_history.append({"role": "assistant", "content": full_reply_content})
-            emit('ai_response', {'text': full_reply_content, 'is_final': True})
+
+        # Send any remaining content to TTS
+        if batched_content:
+            tts_queue.put(batched_content)
+
+        full_reply_content = ''.join(collected_messages).strip()
+        conversation_history.append({"role": "assistant", "content": full_reply_content})
+        emit('ai_response', {'text': full_reply_content, 'is_final': True})
+
+        # Wait for TTS queue to be processed
+        tts_queue.join()
+
+        # Stop TTS worker thread
+        tts_queue.put(None)
+        tts_thread.join()
 
         # Emit a message indicating the entire response is complete
         emit('response_complete')
